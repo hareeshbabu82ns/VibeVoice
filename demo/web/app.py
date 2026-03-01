@@ -311,7 +311,6 @@ class StreamingTTSService:
                 pass
         if self.model:
             self.model.set_ddpm_inference_steps(num_steps=steps_to_use)
-        self.inference_steps = steps_to_use
 
         inputs = self._prepare_inputs(text, prefilled_outputs)
         audio_streamer = AudioStreamer(batch_size=1, stop_signal=None, timeout=None)
@@ -445,10 +444,13 @@ async def _startup() -> None:
         raise RuntimeError("MODEL_PATH not set in environment")
 
     device = os.environ.get("MODEL_DEVICE", "cuda")
-    
+    inference_steps_raw = os.environ.get("INFERENCE_STEPS")
+    inference_steps = int(inference_steps_raw) if inference_steps_raw and inference_steps_raw.isdigit() else 5
+
     service = StreamingTTSService(
         model_path=model_path,
-        device=device
+        device=device,
+        inference_steps=inference_steps,
     )
     service.load()
 
@@ -678,6 +680,7 @@ class TTSRequest(BaseModel):
     temperature: float = Field(0.9, ge=0.0, le=2.0)
     top_p: float = Field(0.9, ge=0.0, le=1.0)
     format: str = Field("wav", description="Output format: 'wav' or 'pcm'.")
+    voice: Optional[str] = Field(None, description="Default voice for segments without an explicit speaker.")
 
 
 class TTSTextRequest(BaseModel):
@@ -689,6 +692,7 @@ class TTSTextRequest(BaseModel):
     temperature: float = Field(0.9, ge=0.0, le=2.0)
     top_p: float = Field(0.9, ge=0.0, le=1.0)
     format: str = Field("wav", description="Output format: 'wav' or 'pcm'.")
+    voice: Optional[str] = Field(None, description="Default voice for untagged text.")
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +707,7 @@ def _collect_all_audio(
     do_sample: bool,
     temperature: float,
     top_p: float,
+    default_voice_key: Optional[str] = None,
 ) -> np.ndarray:
     """Run multi-speaker generation and return the complete audio array."""
     chunks: List[np.ndarray] = []
@@ -713,6 +718,7 @@ def _collect_all_audio(
         do_sample=do_sample,
         temperature=temperature,
         top_p=top_p,
+        default_voice_key=default_voice_key,
     ):
         chunks.append(chunk)
     if not chunks:
@@ -802,6 +808,7 @@ async def api_tts(req: TTSRequest):
         req.do_sample,
         req.temperature,
         req.top_p,
+        req.voice,
     )
 
     if audio.size == 0:
@@ -860,6 +867,7 @@ async def api_tts_text(req: TTSTextRequest):
         req.do_sample,
         req.temperature,
         req.top_p,
+        req.voice,
     )
 
     if audio.size == 0:
@@ -913,6 +921,7 @@ async def api_tts_stream(req: TTSRequest):
             do_sample=req.do_sample,
             temperature=req.temperature,
             top_p=req.top_p,
+            default_voice_key=req.voice,
         ):
             chunk = np.clip(chunk, -1.0, 1.0)
             pcm = (chunk * 32767.0).astype(np.int16)
@@ -952,6 +961,7 @@ async def api_tts_stream_text(req: TTSTextRequest):
             do_sample=req.do_sample,
             temperature=req.temperature,
             top_p=req.top_p,
+            default_voice_key=req.voice,
         ):
             chunk = np.clip(chunk, -1.0, 1.0)
             pcm = (chunk * 32767.0).astype(np.int16)

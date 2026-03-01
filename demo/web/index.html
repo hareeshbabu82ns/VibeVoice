@@ -1,6 +1,8 @@
 <!DOCTYPE html>
 <html lang="en">
+<head>
 <meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>VibeVoice-Realtime TTS Demo</title>
 <style>
   :root {
@@ -316,6 +318,7 @@
     }
   }
 </style>
+</head>
 <body>
   <div class="app-shell">
     <h1>VibeVoice-Realtime TTS Demo</h1>
@@ -333,17 +336,18 @@
       <div id="streamingPreviewContainer">
         <div id="streamingPreviewHeader">
           <span>Streaming Input Text</span>
+          <span id="streamingPreviewNote">Text streams word-by-word as synthesis progresses</span>
         </div>
         <div id="streamingPreview" aria-live="polite">This area will display the streaming input text in real time.</div>
       </div>
+      <span class="helper-text">This demo requires the full text to be provided upfront. The model then receives the text via streaming input during synthesis.<br>
+        For non-punctuation special characters, applying text normalization before processing often yields better results.</span>
     </section>
-          <span class="helper-text">This demo requires the full text to be provided upfront. The model then receives the text via streaming input during synthesis.<br>
-            For non-punctuation special characters, applying text normalization before processing often yields better results.</span>
           
     <section class="panel control-panel">
       <div class="control-row" style="align-items: center; gap: 20px;">
         <div class="inline-field" id="singleSpeakerField">
-          <span class="field-label">Speaker</span>
+          <span class="field-label" id="speakerFieldLabel">Speaker</span>
           <select id="voiceSelect" class="select-control">
             <option value="">Loading...</option>
           </select>
@@ -435,6 +439,7 @@
   const multiSpeakerToggle = document.getElementById('multiSpeakerToggle');
   const multiSpeakerHint = document.getElementById('multiSpeakerHint');
   const singleSpeakerField = document.getElementById('singleSpeakerField');
+  const speakerFieldLabel = document.getElementById('speakerFieldLabel');
 
   const SINGLE_SPEAKER_SAMPLE = 'Enter your text here and click "Start" to instantly hear the VibeVoice-Realtime TTS output audio.';
   const MULTI_SPEAKER_SAMPLE =
@@ -729,6 +734,9 @@
   multiSpeakerToggle.addEventListener('change', () => {
     const isMulti = multiSpeakerToggle.checked;
     multiSpeakerHint.style.display = isMulti ? 'block' : 'none';
+    if (speakerFieldLabel) {
+      speakerFieldLabel.textContent = isMulti ? 'Fallback Voice' : 'Speaker';
+    }
     if (isMulti) {
       if (!promptInput.value.trim() || promptInput.value.trim() === SINGLE_SPEAKER_SAMPLE) {
         promptInput.value = MULTI_SPEAKER_SAMPLE;
@@ -818,9 +826,16 @@
     }
   };
 
+  let isConnecting = false;
+
   const updateButtonLabel = () => {
-    controlBtn.textContent = isPlaying ? 'Stop' : 'Start';
-    controlBtn.classList.toggle('playing', isPlaying);
+    if (isConnecting) {
+      controlBtn.textContent = 'Connecting…';
+      controlBtn.classList.remove('playing');
+    } else {
+      controlBtn.textContent = isPlaying ? 'Stop' : 'Start';
+      controlBtn.classList.toggle('playing', isPlaying);
+    }
   };
 
   const appendAudio = chunk => {
@@ -976,8 +991,18 @@
 
     socket = new WebSocket(wsUrl);
     socket.binaryType = 'arraybuffer';
+    isConnecting = true;
+    updateButtonLabel();
+
+    socket.onopen = () => {
+      // Connection established; audio will arrive shortly
+    };
 
     socket.onmessage = event => {
+      if (isConnecting) {
+        isConnecting = false;
+        updateButtonLabel();
+      }
       if (typeof event.data === 'string') {
         handleLogMessage(event.data);
         return;
@@ -1004,12 +1029,14 @@
     };
 
     socket.onerror = err => {
+      isConnecting = false;
       console.error('WebSocket error', err);
-      appendLog(`[Error] WebSocket error: ${err?.message || err}`);
+      appendLog(`[Error] WebSocket error: ${err?.message || String(err)}`);
       stop();
     };
 
     socket.onclose = () => {
+      isConnecting = false;
       socket = null;
       if (recordedSamples > 0) {
         recordingComplete = true;
@@ -1019,6 +1046,7 @@
   };
 
   const stop = () => {
+    isConnecting = false;
     if (!isPlaying) {
       resetState(false);
       updateButtonLabel();
