@@ -341,11 +341,20 @@
             For non-punctuation special characters, applying text normalization before processing often yields better results.</span>
           
     <section class="panel control-panel">
-      <div class="inline-field">
-        <span class="field-label">Speaker</span>
-        <select id="voiceSelect" class="select-control">
-          <option value="">Loading...</option>
-        </select>
+      <div class="control-row" style="align-items: center; gap: 20px;">
+        <div class="inline-field" id="singleSpeakerField">
+          <span class="field-label">Speaker</span>
+          <select id="voiceSelect" class="select-control">
+            <option value="">Loading...</option>
+          </select>
+        </div>
+        <div class="inline-field" style="gap:6px;">
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:14px; font-weight:500; user-select:none;">
+            <input type="checkbox" id="multiSpeakerToggle" style="accent-color:var(--accent); width:16px; height:16px;" />
+            Multi-Speaker Mode
+          </label>
+          <span class="helper-text" id="multiSpeakerHint" style="display:none;">Use <code>[voice-name]</code> tags to assign speakers. The Speaker dropdown becomes the fallback voice for untagged text.</span>
+        </div>
       </div>
 
       <div class="control-row">
@@ -422,6 +431,17 @@
   let recordedSamples = 0;
   let recordingComplete = false;
   let downloadUrl = null;
+
+  const multiSpeakerToggle = document.getElementById('multiSpeakerToggle');
+  const multiSpeakerHint = document.getElementById('multiSpeakerHint');
+  const singleSpeakerField = document.getElementById('singleSpeakerField');
+
+  const SINGLE_SPEAKER_SAMPLE = 'Enter your text here and click "Start" to instantly hear the VibeVoice-Realtime TTS output audio.';
+  const MULTI_SPEAKER_SAMPLE =
+    '[en-Carter_man] Good morning! Have you tried the new VibeVoice realtime model yet?\n' +
+    '[en-Emma_woman] Not yet, but I heard it can do streaming text to speech in real time. That sounds amazing!\n' +
+    '[en-Carter_man] It really is. The audio quality is surprisingly good even at just five inference steps.\n' +
+    '[en-Emma_woman] I will definitely give it a try this weekend. Thanks for the recommendation!';
 
   const revokeDownloadUrl = () => {
     if (downloadUrl) {
@@ -705,6 +725,21 @@
 
   loadVoices();
 
+  // Multi-speaker toggle behaviour
+  multiSpeakerToggle.addEventListener('change', () => {
+    const isMulti = multiSpeakerToggle.checked;
+    multiSpeakerHint.style.display = isMulti ? 'block' : 'none';
+    if (isMulti) {
+      if (!promptInput.value.trim() || promptInput.value.trim() === SINGLE_SPEAKER_SAMPLE) {
+        promptInput.value = MULTI_SPEAKER_SAMPLE;
+      }
+    } else {
+      if (promptInput.value.trim() === MULTI_SPEAKER_SAMPLE) {
+        promptInput.value = SINGLE_SPEAKER_SAMPLE;
+      }
+    }
+  });
+
   resetBtn.addEventListener('click', () => {
     cfgSelect.value = '1.5';
     stepsSelect.value = '5';
@@ -764,6 +799,14 @@
       case 'client_disconnected':
         appendLog('[Frontend] Client disconnected', timestamp);
         break;
+      case 'speaker_change': {
+        const spk = data.speaker || 'default';
+        const voice = data.voice || spk;
+        const idx = (data.segment_index ?? 0) + 1;
+        const total = data.total_segments ?? '?';
+        appendLog(`[Backend]  Speaker change → ${spk} (voice: ${voice}) [${idx}/${total}]`, timestamp);
+        break;
+      }
       case 'backend_stream_complete':
         appendLog('[Backend]  Backend finished', timestamp);
         recordingComplete = true;

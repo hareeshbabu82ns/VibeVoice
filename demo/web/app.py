@@ -1,19 +1,23 @@
 import datetime
 import builtins
 import asyncio
+import io
 import json
 import os
+import struct
 import threading
 import traceback
+import wave
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple, cast
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, cast
 
 import numpy as np
 import torch
-from fastapi import FastAPI, WebSocket
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, WebSocket, Request, Body, HTTPException
+from fastapi.responses import FileResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from vibevoice.modular.modeling_vibevoice_streaming_inference import (
@@ -25,9 +29,50 @@ from vibevoice.processor.vibevoice_streaming_processor import (
 from vibevoice.modular.streamer import AudioStreamer
 
 import copy
+import re
 
 BASE = Path(__file__).parent
 SAMPLE_RATE = 24_000
+
+
+def parse_multi_speaker_text(text: str) -> list:
+    """Parse text with [SpeakerName] tags into a list of (speaker, text) tuples.
+
+    Format:
+        [en-Carter_man] Hello, how are you?
+        [en-Emma_woman] I'm doing great, thanks!
+
+    If no speaker tags are found, returns a single segment with speaker=None.
+    """
+    pattern = re.compile(r"\[([^\]]+)\]")
+    segments = []
+    last_end = 0
+    current_speaker = None
+
+    for match in pattern.finditer(text):
+        # Capture any text before this tag that belongs to the previous speaker
+        preceding_text = text[last_end:match.start()].strip()
+        if preceding_text and current_speaker is not None:
+            segments.append((current_speaker, preceding_text))
+        elif preceding_text and current_speaker is None:
+            # Text before the very first tag — treat as untagged
+            segments.append((None, preceding_text))
+
+        current_speaker = match.group(1).strip()
+        last_end = match.end()
+
+    # Remaining text after the last tag
+    remaining = text[last_end:].strip()
+    if remaining:
+        segments.append((current_speaker, remaining))
+
+    # If nothing was parsed (no tags at all), return the whole text as one segment
+    if not segments:
+        stripped = text.strip()
+        if stripped:
+            segments.append((None, stripped))
+
+    return segments
 
 
 def get_timestamp():
@@ -326,6 +371,64 @@ class StreamingTTSService:
                 emit("generation_error", message=str(errors[0]))
                 raise errors[0]
 
+    def stream_multi_speaker(
+        self,
+        segments: list,
+        cfg_scale: float = 1.5,
+        do_sample: bool = False,
+        temperature: float = 0.9,
+        top_p: float = 0.9,
+        refresh_negative: bool = True,
+        inference_steps: Optional[int] = None,
+        default_voice_key: Optional[str] = None,
+        log_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        stop_event: Optional[threading.Event] = None,
+    ) -> Iterator[Tuple[Optional[str], np.ndarray]]:
+        """Generate audio for multiple speaker segments sequentially.
+
+        Yields (speaker_name, audio_chunk) tuples so the caller can
+        track which speaker is currently being synthesized.
+        """
+        stop_signal = stop_event or threading.Event()
+
+        for idx, (speaker, text) in enumerate(segments):
+            if stop_signal.is_set():
+                break
+
+            voice = speaker if speaker and speaker in self.voice_presets else default_voice_key
+
+            if log_callback:
+                log_callback(
+                    "speaker_change",
+                    speaker=speaker or "default",
+                    voice=voice,
+                    segment_index=idx,
+                    total_segments=len(segments),
+                )
+
+            # Each segment gets its own per-segment stop event so that
+            # the stream() finally-block (which calls stop_signal.set())
+            # does not abort the remaining segments.  We propagate the
+            # outer stop_signal into it manually.
+            segment_stop = threading.Event()
+
+            for chunk in self.stream(
+                text=text,
+                cfg_scale=cfg_scale,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=top_p,
+                refresh_negative=refresh_negative,
+                inference_steps=inference_steps,
+                voice_key=voice,
+                log_callback=log_callback,
+                stop_event=segment_stop,
+            ):
+                if stop_signal.is_set():
+                    segment_stop.set()
+                    break
+                yield (speaker, chunk)
+
     def chunk_to_pcm16(self, chunk: np.ndarray) -> bytes:
         chunk = np.clip(chunk, -1.0, 1.0)
         pcm = (chunk * 32767.0).astype(np.int16)
@@ -360,6 +463,18 @@ def streaming_tts(text: str, **kwargs) -> Iterator[np.ndarray]:
     service: StreamingTTSService = app.state.tts_service
     yield from service.stream(text, **kwargs)
 
+
+def streaming_tts_multi(segments: list, **kwargs) -> Iterator[Tuple[Optional[str], np.ndarray]]:
+    """Yield (speaker, audio_chunk) for multi-speaker segments."""
+    service: StreamingTTSService = app.state.tts_service
+    yield from service.stream_multi_speaker(segments, **kwargs)
+
+
+def _is_multi_speaker(text: str) -> bool:
+    """Return True if the text contains [SpeakerName] tags."""
+    return bool(re.search(r"\[[^\]]+\]", text))
+
+
 @app.websocket("/stream")
 async def websocket_stream(ws: WebSocket) -> None:
     await ws.accept()
@@ -384,6 +499,13 @@ async def websocket_stream(ws: WebSocket) -> None:
 
     service: StreamingTTSService = app.state.tts_service
     lock: asyncio.Lock = app.state.websocket_lock
+
+    # Detect multi-speaker mode
+    multi_speaker = _is_multi_speaker(text)
+    segments = parse_multi_speaker_text(text) if multi_speaker else []
+    if multi_speaker:
+        print(f"[multi-speaker] Detected {len(segments)} segment(s): "
+              + ", ".join(f"{s or 'default'}" for s, _ in segments))
 
     if lock.locked():
         busy_message = {
@@ -433,18 +555,33 @@ async def websocket_stream(ws: WebSocket) -> None:
             cfg_scale=cfg_scale,
             inference_steps=inference_steps,
             voice=voice_param,
+            multi_speaker=multi_speaker,
+            segments=len(segments) if multi_speaker else 1,
         )
 
         stop_signal = threading.Event()
 
-        iterator = streaming_tts(
-            text,
-            cfg_scale=cfg_scale,
-            inference_steps=inference_steps,
-            voice_key=voice_param,
-            log_callback=enqueue_log,
-            stop_event=stop_signal,
-        )
+        if multi_speaker:
+            iterator = streaming_tts_multi(
+                segments,
+                cfg_scale=cfg_scale,
+                inference_steps=inference_steps,
+                default_voice_key=voice_param or service.default_voice_key,
+                log_callback=enqueue_log,
+                stop_event=stop_signal,
+            )
+        else:
+            # Wrap single-speaker iterator to match (speaker, chunk) shape
+            _inner = streaming_tts(
+                text,
+                cfg_scale=cfg_scale,
+                inference_steps=inference_steps,
+                voice_key=voice_param,
+                log_callback=enqueue_log,
+                stop_event=stop_signal,
+            )
+            iterator = ((None, chunk) for chunk in _inner)
+
         sentinel = object()
         first_ws_send_logged = False
 
@@ -453,9 +590,10 @@ async def websocket_stream(ws: WebSocket) -> None:
         try:
             while ws.client_state == WebSocketState.CONNECTED:
                 await flush_logs()
-                chunk = await asyncio.to_thread(next, iterator, sentinel)
-                if chunk is sentinel:
+                result = await asyncio.to_thread(next, iterator, sentinel)
+                if result is sentinel:
                     break
+                speaker, chunk = result
                 chunk = cast(np.ndarray, chunk)
                 payload = service.chunk_to_pcm16(chunk)
                 await ws.send_bytes(payload)
@@ -513,3 +651,464 @@ def get_config():
         "default_voice": service.default_voice_key,
     }
 
+
+# ---------------------------------------------------------------------------
+#  REST API – Pydantic models
+# ---------------------------------------------------------------------------
+
+class SpeakerSegment(BaseModel):
+    """A single speaker segment."""
+    speaker: Optional[str] = Field(
+        None,
+        description="Voice preset name (e.g. 'en-Carter_man'). Omit to use the default voice.",
+    )
+    text: str = Field(..., description="Text for this speaker to say.")
+
+
+class TTSRequest(BaseModel):
+    """JSON body for the TTS API."""
+    segments: List[SpeakerSegment] = Field(
+        ...,
+        description="Ordered list of speaker segments.",
+        min_length=1,
+    )
+    cfg_scale: float = Field(1.5, ge=0.1, le=10.0, description="Classifier-free guidance scale.")
+    inference_steps: Optional[int] = Field(None, ge=1, le=50, description="Diffusion inference steps.")
+    do_sample: bool = Field(False, description="Enable sampling in generation.")
+    temperature: float = Field(0.9, ge=0.0, le=2.0)
+    top_p: float = Field(0.9, ge=0.0, le=1.0)
+    format: str = Field("wav", description="Output format: 'wav' or 'pcm'.")
+
+
+class TTSTextRequest(BaseModel):
+    """Alternative: send a single text with [Speaker] tags."""
+    text: str = Field(..., description="Text with optional [SpeakerName] tags.")
+    cfg_scale: float = Field(1.5, ge=0.1, le=10.0)
+    inference_steps: Optional[int] = Field(None, ge=1, le=50)
+    do_sample: bool = Field(False)
+    temperature: float = Field(0.9, ge=0.0, le=2.0)
+    top_p: float = Field(0.9, ge=0.0, le=1.0)
+    format: str = Field("wav", description="Output format: 'wav' or 'pcm'.")
+
+
+# ---------------------------------------------------------------------------
+#  Helpers
+# ---------------------------------------------------------------------------
+
+def _collect_all_audio(
+    service: StreamingTTSService,
+    segments: List[Tuple[Optional[str], str]],
+    cfg_scale: float,
+    inference_steps: Optional[int],
+    do_sample: bool,
+    temperature: float,
+    top_p: float,
+) -> np.ndarray:
+    """Run multi-speaker generation and return the complete audio array."""
+    chunks: List[np.ndarray] = []
+    for _speaker, chunk in service.stream_multi_speaker(
+        segments,
+        cfg_scale=cfg_scale,
+        inference_steps=inference_steps,
+        do_sample=do_sample,
+        temperature=temperature,
+        top_p=top_p,
+    ):
+        chunks.append(chunk)
+    if not chunks:
+        return np.array([], dtype=np.float32)
+    return np.concatenate(chunks)
+
+
+def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> bytes:
+    """Convert a float32 numpy array to a WAV file in memory."""
+    audio = np.clip(audio, -1.0, 1.0)
+    pcm = (audio * 32767.0).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm.tobytes())
+    return buf.getvalue()
+
+
+def _wav_header(sample_rate: int = SAMPLE_RATE, bits: int = 16, channels: int = 1) -> bytes:
+    """Create a WAV header for streaming (unknown length → 0xFFFFFFFF)."""
+    byte_rate = sample_rate * channels * (bits // 8)
+    block_align = channels * (bits // 8)
+    # Use max uint32 for data size to signal streaming
+    data_size = 0xFFFFFFFF
+    file_size = 36 + data_size  # will overflow for uint32, that's OK for streaming
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        file_size & 0xFFFFFFFF,
+        b"WAVE",
+        b"fmt ",
+        16,            # chunk size
+        1,             # PCM format
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits,
+        b"data",
+        data_size & 0xFFFFFFFF,
+    )
+    return header
+
+
+def _segments_from_request(req: TTSRequest) -> List[Tuple[Optional[str], str]]:
+    return [(seg.speaker, seg.text) for seg in req.segments]
+
+
+def _segments_from_text_request(req: TTSTextRequest) -> List[Tuple[Optional[str], str]]:
+    return parse_multi_speaker_text(req.text)
+
+
+# ---------------------------------------------------------------------------
+#  POST /api/tts  –  Full download (WAV or raw PCM)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/tts", summary="Generate TTS audio (full download)")
+async def api_tts(req: TTSRequest):
+    """Accept a JSON list of speaker segments and return the complete audio file.
+
+    Example request:
+    ```json
+    {
+      "segments": [
+        {"speaker": "en-Carter_man", "text": "Hello, how are you?"},
+        {"speaker": "en-Emma_woman", "text": "I am doing great, thanks!"}
+      ],
+      "cfg_scale": 1.5,
+      "format": "wav"
+    }
+    ```
+    """
+    service: StreamingTTSService = app.state.tts_service
+    segments = _segments_from_request(req)
+
+    if not segments:
+        raise HTTPException(status_code=400, detail="No text segments provided.")
+
+    audio = await asyncio.to_thread(
+        _collect_all_audio,
+        service,
+        segments,
+        req.cfg_scale,
+        req.inference_steps,
+        req.do_sample,
+        req.temperature,
+        req.top_p,
+    )
+
+    if audio.size == 0:
+        raise HTTPException(status_code=500, detail="No audio generated.")
+
+    if req.format == "pcm":
+        pcm = np.clip(audio, -1.0, 1.0)
+        pcm_bytes = (pcm * 32767.0).astype(np.int16).tobytes()
+        return Response(
+            content=pcm_bytes,
+            media_type="audio/pcm",
+            headers={
+                "Content-Disposition": "attachment; filename=tts_output.pcm",
+                "X-Sample-Rate": str(SAMPLE_RATE),
+                "X-Channels": "1",
+                "X-Bits-Per-Sample": "16",
+            },
+        )
+
+    wav_bytes = _audio_to_wav_bytes(audio)
+    return Response(
+        content=wav_bytes,
+        media_type="audio/wav",
+        headers={"Content-Disposition": "attachment; filename=tts_output.wav"},
+    )
+
+
+# ---------------------------------------------------------------------------
+#  POST /api/tts/text  –  Tagged text input (full download)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/tts/text", summary="Generate TTS from tagged text (full download)")
+async def api_tts_text(req: TTSTextRequest):
+    """Accept text with [SpeakerName] tags and return the complete audio file.
+
+    Example request:
+    ```json
+    {
+      "text": "[en-Carter_man] Hello! [en-Emma_woman] Hi there!",
+      "format": "wav"
+    }
+    ```
+    """
+    service: StreamingTTSService = app.state.tts_service
+    segments = _segments_from_text_request(req)
+
+    if not segments:
+        raise HTTPException(status_code=400, detail="No text provided.")
+
+    audio = await asyncio.to_thread(
+        _collect_all_audio,
+        service,
+        segments,
+        req.cfg_scale,
+        req.inference_steps,
+        req.do_sample,
+        req.temperature,
+        req.top_p,
+    )
+
+    if audio.size == 0:
+        raise HTTPException(status_code=500, detail="No audio generated.")
+
+    if req.format == "pcm":
+        pcm = np.clip(audio, -1.0, 1.0)
+        pcm_bytes = (pcm * 32767.0).astype(np.int16).tobytes()
+        return Response(
+            content=pcm_bytes,
+            media_type="audio/pcm",
+            headers={
+                "Content-Disposition": "attachment; filename=tts_output.pcm",
+                "X-Sample-Rate": str(SAMPLE_RATE),
+            },
+        )
+
+    wav_bytes = _audio_to_wav_bytes(audio)
+    return Response(
+        content=wav_bytes,
+        media_type="audio/wav",
+        headers={"Content-Disposition": "attachment; filename=tts_output.wav"},
+    )
+
+
+# ---------------------------------------------------------------------------
+#  POST /api/tts/stream  –  Streaming chunked WAV audio
+# ---------------------------------------------------------------------------
+
+@app.post("/api/tts/stream", summary="Stream TTS audio (chunked)")
+async def api_tts_stream(req: TTSRequest):
+    """Accept a JSON list of speaker segments and stream audio chunks back.
+
+    Returns a chunked WAV stream. The first chunk is the WAV header,
+    followed by PCM audio chunks as they are generated.
+    """
+    service: StreamingTTSService = app.state.tts_service
+    segments = _segments_from_request(req)
+
+    if not segments:
+        raise HTTPException(status_code=400, detail="No text segments provided.")
+
+    def _generate():
+        # Yield WAV header first (streaming-style with unknown length)
+        yield _wav_header()
+
+        for _speaker, chunk in service.stream_multi_speaker(
+            segments,
+            cfg_scale=req.cfg_scale,
+            inference_steps=req.inference_steps,
+            do_sample=req.do_sample,
+            temperature=req.temperature,
+            top_p=req.top_p,
+        ):
+            chunk = np.clip(chunk, -1.0, 1.0)
+            pcm = (chunk * 32767.0).astype(np.int16)
+            yield pcm.tobytes()
+
+    return StreamingResponse(
+        _generate(),
+        media_type="audio/wav",
+        headers={
+            "Content-Disposition": "inline; filename=tts_stream.wav",
+            "X-Sample-Rate": str(SAMPLE_RATE),
+            "Transfer-Encoding": "chunked",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+#  POST /api/tts/stream/text  –  Streaming from tagged text
+# ---------------------------------------------------------------------------
+
+@app.post("/api/tts/stream/text", summary="Stream TTS from tagged text (chunked)")
+async def api_tts_stream_text(req: TTSTextRequest):
+    """Accept text with [SpeakerName] tags and stream audio chunks back."""
+    service: StreamingTTSService = app.state.tts_service
+    segments = _segments_from_text_request(req)
+
+    if not segments:
+        raise HTTPException(status_code=400, detail="No text provided.")
+
+    def _generate():
+        yield _wav_header()
+
+        for _speaker, chunk in service.stream_multi_speaker(
+            segments,
+            cfg_scale=req.cfg_scale,
+            inference_steps=req.inference_steps,
+            do_sample=req.do_sample,
+            temperature=req.temperature,
+            top_p=req.top_p,
+        ):
+            chunk = np.clip(chunk, -1.0, 1.0)
+            pcm = (chunk * 32767.0).astype(np.int16)
+            yield pcm.tobytes()
+
+    return StreamingResponse(
+        _generate(),
+        media_type="audio/wav",
+        headers={
+            "Content-Disposition": "inline; filename=tts_stream.wav",
+            "X-Sample-Rate": str(SAMPLE_RATE),
+            "Transfer-Encoding": "chunked",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+#  GET /api/voices  –  List available voices
+# ---------------------------------------------------------------------------
+
+@app.get("/api/voices", summary="List available voice presets")
+def api_voices():
+    service: StreamingTTSService = app.state.tts_service
+    voices = sorted(service.voice_presets.keys())
+    return {
+        "voices": voices,
+        "default_voice": service.default_voice_key,
+        "total": len(voices),
+    }
+
+
+# ---------------------------------------------------------------------------
+#  POST /api/tts/plain  –  Plain text input (full download)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/tts/plain", summary="Generate TTS from plain text with [Speaker] tags (download)")
+async def api_tts_plain(request: Request):
+    """Accept raw plain text with [SpeakerName] tags and return audio.
+
+    Send the body as text/plain. Optional query params: cfg_scale, steps, format.
+
+    Example:
+        curl -X POST http://localhost:8001/api/tts/plain \\
+          -H "Content-Type: text/plain" \\
+          -d '[en-Carter_man] Hello! [en-Emma_woman] Hi there!' \\
+          --output output.wav
+    """
+    service: StreamingTTSService = app.state.tts_service
+    body = (await request.body()).decode("utf-8").strip()
+
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty body.")
+
+    segments = parse_multi_speaker_text(body)
+    if not segments:
+        raise HTTPException(status_code=400, detail="No text segments found.")
+
+    cfg_scale = float(request.query_params.get("cfg_scale", "1.5"))
+    inference_steps_raw = request.query_params.get("steps")
+    inference_steps = int(inference_steps_raw) if inference_steps_raw else None
+    fmt = request.query_params.get("format", "wav")
+
+    audio = await asyncio.to_thread(
+        _collect_all_audio,
+        service,
+        segments,
+        cfg_scale,
+        inference_steps,
+        False,   # do_sample
+        0.9,     # temperature
+        0.9,     # top_p
+    )
+
+    if audio.size == 0:
+        raise HTTPException(status_code=500, detail="No audio generated.")
+
+    if fmt == "pcm":
+        pcm = np.clip(audio, -1.0, 1.0)
+        pcm_bytes = (pcm * 32767.0).astype(np.int16).tobytes()
+        return Response(
+            content=pcm_bytes,
+            media_type="audio/pcm",
+            headers={
+                "Content-Disposition": "attachment; filename=tts_output.pcm",
+                "X-Sample-Rate": str(SAMPLE_RATE),
+            },
+        )
+
+    wav_bytes = _audio_to_wav_bytes(audio)
+    return Response(
+        content=wav_bytes,
+        media_type="audio/wav",
+        headers={"Content-Disposition": "attachment; filename=tts_output.wav"},
+    )
+
+
+# ---------------------------------------------------------------------------
+#  POST /api/tts/stream/plain  –  Plain text input (streaming)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/tts/stream/plain", summary="Stream TTS from plain text with [Speaker] tags")
+async def api_tts_stream_plain(request: Request):
+    """Accept raw plain text with [SpeakerName] tags and stream audio back.
+
+    Example:
+        curl -X POST http://localhost:8001/api/tts/stream/plain \\
+          -H "Content-Type: text/plain" \\
+          -d '[en-Carter_man] Hello! [en-Emma_woman] Hi there!' \\
+          --output stream.wav
+    """
+    service: StreamingTTSService = app.state.tts_service
+    body = (await request.body()).decode("utf-8").strip()
+
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty body.")
+
+    segments = parse_multi_speaker_text(body)
+    if not segments:
+        raise HTTPException(status_code=400, detail="No text segments found.")
+
+    cfg_scale = float(request.query_params.get("cfg_scale", "1.5"))
+    inference_steps_raw = request.query_params.get("steps")
+    inference_steps = int(inference_steps_raw) if inference_steps_raw else None
+
+    def _generate():
+        yield _wav_header()
+
+        for _speaker, chunk in service.stream_multi_speaker(
+            segments,
+            cfg_scale=cfg_scale,
+            inference_steps=inference_steps,
+        ):
+            chunk = np.clip(chunk, -1.0, 1.0)
+            pcm = (chunk * 32767.0).astype(np.int16)
+            yield pcm.tobytes()
+
+    return StreamingResponse(
+        _generate(),
+        media_type="audio/wav",
+        headers={
+            "Content-Disposition": "inline; filename=tts_stream.wav",
+            "X-Sample-Rate": str(SAMPLE_RATE),
+            "Transfer-Encoding": "chunked",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+#  GET /api/health  –  Health check
+# ---------------------------------------------------------------------------
+
+@app.get("/api/health", summary="Health check")
+def api_health():
+    service: StreamingTTSService = app.state.tts_service
+    return {
+        "status": "ok",
+        "model_loaded": service.model is not None,
+        "device": service.device,
+        "sample_rate": SAMPLE_RATE,
+    }

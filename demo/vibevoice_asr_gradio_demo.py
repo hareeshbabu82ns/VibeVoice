@@ -475,6 +475,10 @@ def initialize_model(model_path: str, device: str = "cuda", attn_implementation:
     global asr_model
     try:
         dtype = torch.bfloat16 if device != "cpu" else torch.float32
+        # flash_attention_2 is only supported on CUDA; fall back to sdpa on MPS/CPU
+        if device == "mps" and attn_implementation == "flash_attention_2":
+            print("⚠️ flash_attention_2 is not supported on MPS, falling back to sdpa")
+            attn_implementation = "sdpa"
         asr_model = VibeVoiceASRInference(
             model_path=model_path,
             device=device,
@@ -883,17 +887,19 @@ def transcribe_audio(
         yield f"❌ Error during transcription: {str(e)}", ""
 
 
-def create_gradio_interface(model_path: str, default_max_tokens: int = 8192, attn_implementation: str = "flash_attention_2"):
+def create_gradio_interface(model_path: str, default_max_tokens: int = 8192, attn_implementation: str = "flash_attention_2", device: str = None):
     """Create and launch Gradio interface.
     
     Args:
         model_path: Path to the model (HuggingFace format directory or model name)
         default_max_tokens: Default value for max_new_tokens slider
         attn_implementation: Attention implementation to use ('flash_attention_2', 'sdpa', 'eager')
+        device: Device to run inference on ('cpu', 'cuda', 'mps'). Auto-detected if None.
     """
     
     # Initialize model at startup
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
     model_status = initialize_model(model_path, device, attn_implementation)
     print(model_status)
     
@@ -1145,6 +1151,13 @@ def main():
         action="store_true",
         help="Create a public link"
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        choices=["cpu", "cuda", "mps"],
+        help="Device to run inference on (default: auto-detect cuda or cpu)"
+    )
     
     args = parser.parse_args()
     
@@ -1152,7 +1165,8 @@ def main():
     demo, custom_css = create_gradio_interface(
         model_path=args.model_path,
         default_max_tokens=args.max_new_tokens,
-        attn_implementation=args.attn_implementation
+        attn_implementation=args.attn_implementation,
+        device=args.device
     )
     
     print(f"🚀 Starting VibeVoice ASR Demo...")
