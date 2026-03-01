@@ -89,11 +89,13 @@ class StreamingTTSService:
         model_path: str,
         device: str = "cuda",
         inference_steps: int = 5,
+        voices_dir: Optional[str] = None,
     ) -> None:
         # Keep model_path as string for HuggingFace repo IDs (Path() converts / to \ on Windows)
         self.model_path = model_path
         self.inference_steps = inference_steps
         self.sample_rate = SAMPLE_RATE
+        self._voices_dir: Optional[Path] = Path(voices_dir) if voices_dir else None
 
         self.processor: Optional[VibeVoiceStreamingProcessor] = None
         self.model: Optional[VibeVoiceStreamingForConditionalGenerationInference] = None
@@ -169,7 +171,10 @@ class StreamingTTSService:
         self._ensure_voice_cached(self.default_voice_key)
 
     def _load_voice_presets(self) -> Dict[str, Path]:
-        voices_dir = BASE.parent / "voices" / "streaming_model"
+        if self._voices_dir is not None:
+            voices_dir = self._voices_dir
+        else:
+            voices_dir = BASE.parent / "voices" / "streaming_model"
         if not voices_dir.exists():
             raise RuntimeError(f"Voices directory not found: {voices_dir}")
 
@@ -180,7 +185,7 @@ class StreamingTTSService:
         if not presets:
             raise RuntimeError(f"No voice preset (.pt) files found in {voices_dir}")
 
-        print(f"[startup] Found {len(presets)} voice presets")
+        print(f"[startup] Found {len(presets)} voice presets in {voices_dir}")
         return dict(sorted(presets.items()))
 
     def _determine_voice_key(self, name: Optional[str]) -> str:
@@ -271,6 +276,22 @@ class StreamingTTSService:
                 refresh_negative=refresh_negative,
                 all_prefilled_outputs=copy.deepcopy(prefilled_outputs),
             )
+        except RuntimeError as exc:
+            # Voice preset KV-cache tensors are model-specific. If the head
+            # dimension in the preset doesn't match the loaded model (e.g. using
+            # 0.5B presets with the 1.5B model), PyTorch raises a tensor size
+            # mismatch on torch.cat.  Re-raise with an actionable message.
+            msg = str(exc)
+            if "Sizes of tensors must match" in msg or "size mismatch" in msg.lower():
+                exc = RuntimeError(
+                    f"Voice preset KV-cache is incompatible with the loaded model "
+                    f"({self.model_path}). The preset was likely built for a different "
+                    f"model size. Provide matching presets via the VOICES_DIR env var "
+                    f"or the --voices-dir server option. Original error: {msg}"
+                )
+            errors.append(exc)
+            traceback.print_exc()
+            audio_streamer.end()
         except Exception as exc:  # pragma: no cover - diagnostic logging
             errors.append(exc)
             traceback.print_exc()
@@ -446,11 +467,13 @@ async def _startup() -> None:
     device = os.environ.get("MODEL_DEVICE", "cuda")
     inference_steps_raw = os.environ.get("INFERENCE_STEPS")
     inference_steps = int(inference_steps_raw) if inference_steps_raw and inference_steps_raw.isdigit() else 5
+    voices_dir = os.environ.get("VOICES_DIR")
 
     service = StreamingTTSService(
         model_path=model_path,
         device=device,
         inference_steps=inference_steps,
+        voices_dir=voices_dir,
     )
     service.load()
 

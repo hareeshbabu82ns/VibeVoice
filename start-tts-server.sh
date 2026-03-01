@@ -19,6 +19,7 @@ VENV_DIR="${SCRIPT_DIR}/.venv"
 PORT=8001
 DEVICE="mps"
 MODEL_PATH="${MODEL_PATH:-${HOME}/.cache/huggingface/hub/models--microsoft--VibeVoice-Realtime-0.5B/snapshots/6bce5f06044837fe6d2c5d7a71a84f0416bd57e4}"
+VOICES_DIR="${VOICES_DIR:-}"
 DAEMON=false
 STOP=false
 STATUS=false
@@ -31,16 +32,21 @@ while [[ $# -gt 0 ]]; do
         --port)       PORT="$2"; shift 2 ;;
         --device)     DEVICE="$2"; shift 2 ;;
         --model-path) MODEL_PATH="$2"; shift 2 ;;
+        --voices-dir) VOICES_DIR="$(cd "$2" && pwd)"; shift 2 ;;
         --daemon)     DAEMON=true; shift ;;
         --stop)       STOP=true; shift ;;
         --status)     STATUS=true; shift ;;
         --help|-h)
-            echo "Usage: $0 [--port PORT] [--device DEVICE] [--model-path PATH] [--daemon] [--stop] [--status]"
+            echo "Usage: $0 [--port PORT] [--device DEVICE] [--model-path PATH] [--voices-dir PATH] [--daemon] [--stop] [--status]"
             echo ""
             echo "Options:"
             echo "  --port PORT         Port to listen on (default: 8001)"
             echo "  --device DEVICE     Compute device: mps | cuda | cpu (default: mps)"
             echo "  --model-path PATH   Path to VibeVoice model (default: HuggingFace cache)"
+            echo "  --voices-dir PATH   Directory containing voice preset .pt files"
+            echo "                      (default: demo/voices/streaming_model)"
+            echo "                      Use when running a model that needs different presets,"
+            echo "                      e.g. VibeVoice-1.5B requires its own presets."
             echo "  --daemon            Run in background and keep running"
             echo "  --stop              Stop a running daemon"
             echo "  --status            Check if daemon is running"
@@ -119,6 +125,7 @@ fi
 # ── Export environment ────────────────────────────────────────────────────────
 export MODEL_PATH
 export MODEL_DEVICE="$DEVICE"
+[[ -n "$VOICES_DIR" ]] && export VOICES_DIR
 
 echo "=============================================="
 echo "  VibeVoice TTS API Server"
@@ -126,6 +133,7 @@ echo "=============================================="
 echo "  Model:   $MODEL_PATH"
 echo "  Device:  $DEVICE"
 echo "  Port:    $PORT"
+[[ -n "$VOICES_DIR" ]] && echo "  Voices:  $VOICES_DIR"
 echo "  Python:  $PYTHON"
 echo "=============================================="
 
